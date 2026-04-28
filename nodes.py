@@ -57,9 +57,9 @@ def _encode_relay(model, clip, latent, global_prompt, local_prompts, segment_len
     if not locals_list:
         raise ValueError("At least one local prompt is required (separate with |)")
 
-    arch, patch_size, temporal_stride = detect_model_type(model)
-
     samples = latent["samples"]
+    arch, patch_size, temporal_stride, model_fps = detect_model_type(model, samples)
+
     latent_frames = samples.shape[2]
     tokens_per_frame = (samples.shape[3] // patch_size[1]) * (samples.shape[4] // patch_size[2])
 

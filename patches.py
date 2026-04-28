@@ -111,24 +111,57 @@ class _CrossAttnPatch:
         return types.MethodType(wrapped, obj)
 
 
-def detect_model_type(model):
-    """Return (arch, patch_size, temporal_stride) for latent geometry.
+def detect_model_type(model, latent_samples=None):
+    """Return (arch, patch_size, temporal_stride, fps) for latent geometry.
 
     temporal_stride is the VAE's pixel→latent temporal compression factor,
     used to convert user-facing pixel frame counts to latent frames.
+    fps is the typical or target framerate for the model.
     """
     diff_model = model.model.diffusion_model
 
+    arch = None
+    patch_size = (1, 1, 1)
     if hasattr(diff_model, "patch_size") and not hasattr(diff_model, "patchifier"):
-        return "wan", tuple(diff_model.patch_size), 4
+        arch = "wan"
+        patch_size = tuple(diff_model.patch_size)
+    elif hasattr(diff_model, "patchifier"):
+        arch = "ltx"
+    else:
+        raise ValueError(
+            f"Unsupported model type: {type(diff_model).__name__}. "
+            f"Currently supports Wan and LTX models."
+        )
 
-    if hasattr(diff_model, "patchifier"):
-        return "ltx", (1, 1, 1), int(diff_model.vae_scale_factors[0])
+    # Defaults
+    temporal_stride = 4 if arch == "wan" else int(diff_model.vae_scale_factors[0])
+    fps = 24.0
 
-    raise ValueError(
-        f"Unsupported model type: {type(diff_model).__name__}. "
-        f"Currently supports Wan and LTX models."
-    )
+    if latent_samples is not None:
+        channels = latent_samples.shape[1]
+        if arch == "wan":
+            if channels == 16:
+                temporal_stride = 4
+                fps = 16.0
+            elif channels == 48:
+                temporal_stride = 16
+                fps = 24.0
+            else:
+                fps = 16.0  # fallback
+        elif arch == "ltx":
+            if channels == 128:
+                temporal_stride = 32
+                fps = 25.0
+            else:
+                fps = 25.0  # fallback
+    else:
+        # Fallbacks when latent isn't provided
+        if arch == "wan":
+            fps = 16.0
+        elif arch == "ltx":
+            fps = 25.0
+
+    return arch, patch_size, temporal_stride, fps
 
 
 def _check_unpatched(model_clone, key):

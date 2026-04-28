@@ -94,12 +94,14 @@ class PromptRelaySmartEncodeTest(io.ComfyNode):
             category="conditioning/prompt_relay",
             description="Outputs the parsed syntax for testing purposes.",
             inputs=[
+                io.Model.Input("model", optional=True),
                 io.String.Input(
                     "smart_prompt", multiline=True, default="",
-                    tooltip="Enter prompt using Smart Syntax:\\n1. Inline: 'text one [0-50] | text two [50-100]'\\n2. Block: 'Second 1:\\ntext one\\nSecond 2:\\ntext two'\\nSyntax is auto-stripped and normalized evenly or proportionally."
+                    tooltip="Enter prompt using Smart Syntax:\n1. Inline: 'text one [0-50] | text two [50-100]'\n2. Block: 'Second 1:\ntext one\nSecond 2:\ntext two'\nSyntax is auto-stripped and normalized evenly or proportionally."
                 ),
                 io.Boolean.Input("normalize_by_tokens", default=False),
                 io.Clip.Input("clip", optional=True),
+                io.Latent.Input("latent", optional=True),
             ],
             outputs=[
                 io.String.Output(display_name="parsed_output"),
@@ -107,7 +109,7 @@ class PromptRelaySmartEncodeTest(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, smart_prompt, normalize_by_tokens, clip=None) -> io.NodeOutput:
+    def execute(cls, smart_prompt, normalize_by_tokens, model=None, clip=None, latent=None) -> io.NodeOutput:
         parsed = parse_smart_prompt(smart_prompt)
 
         valid_segments = [s for s in parsed if s["text"].strip()]
@@ -141,5 +143,18 @@ class PromptRelaySmartEncodeTest(io.ComfyNode):
             if token_count is not None:
                 line += f", tokens={token_count}, final_weight={weight}"
             output_lines.append(line)
+
+        if model is not None and latent is not None:
+            try:
+                from .patches import detect_model_type
+                arch, patch_size, temporal_stride, fps = detect_model_type(model, latent.get("samples"))
+                output_lines.append(f"\n--- Model Detection ---")
+                output_lines.append(f"Arch: {arch}")
+                output_lines.append(f"Target FPS: {fps}")
+                output_lines.append(f"Temporal Stride: {temporal_stride}")
+                output_lines.append(f"Patch Size: {patch_size}")
+            except Exception as e:
+                output_lines.append(f"\n--- Model Detection Failed ---")
+                output_lines.append(str(e))
 
         return io.NodeOutput("\n".join(output_lines))
