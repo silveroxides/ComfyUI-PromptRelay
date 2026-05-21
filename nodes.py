@@ -11,6 +11,7 @@ from .prompt_relay import (
 )
 
 from .patches import detect_model_type, apply_patches
+from .advanced_options import PromptRelayAdvancedOptions, RelayOptions
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +53,18 @@ def _convert_to_latent_lengths(pixel_lengths, temporal_stride, latent_frames):
     return result
 
 
-def _encode_relay(model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon):
+def _encode_relay(model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon, relay_options=None):
+    for name, val in (("global_prompt", global_prompt),
+                      ("local_prompts", local_prompts),
+                      ("segment_lengths", segment_lengths)):
+        if val is None:
+            raise ValueError(
+                f"PromptRelay: '{name}' arrived as None. "
+                "Likely causes: a stale workflow JSON saved with null, the timeline "
+                "editor's web extension failing to load, or an upstream node returning None. "
+                "Set the field to an empty string or fix the upstream connection."
+            )
+
     locals_list = [p.strip() for p in local_prompts.split("|") if p.strip()]
     if not locals_list:
         raise ValueError("At least one local prompt is required (separate with |)")
@@ -84,7 +96,7 @@ def _encode_relay(model, clip, latent, global_prompt, local_prompts, segment_len
         latent_frames, tokens_per_frame, effective_lengths,
     )
 
-    q_token_idx = build_segments(token_ranges, effective_lengths, epsilon)
+    q_token_idx = build_segments(token_ranges, effective_lengths, epsilon, relay_options)
     mask_fn = create_mask_fn(q_token_idx, tokens_per_frame, latent_frames)
 
     patched = model.clone()
@@ -127,6 +139,10 @@ class PromptRelayEncode(io.ComfyNode):
                     "epsilon", default=1e-3, min=1e-6, max=0.99, step=1e-4,
                     tooltip="Penalty decay parameter. Values below ~0.1 all produce sharp boundaries (paper default 0.001). For softer transitions, try 0.5 or higher.",
                 ),
+                RelayOptions.Input(
+                    "relay_options", optional=True,
+                    tooltip="Optional advanced per-stream tuning. Connect a Prompt Relay Advanced Options node.",
+                ),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
@@ -135,9 +151,9 @@ class PromptRelayEncode(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon) -> io.NodeOutput:
+    def execute(cls, model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon, relay_options=None) -> io.NodeOutput:
         patched, conditioning = _encode_relay(
-            model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon,
+            model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon, relay_options,
         )
         return io.NodeOutput(patched, conditioning)
 
@@ -192,6 +208,10 @@ class PromptRelayEncodeTimeline(io.ComfyNode):
                     "time_units", options=["frames", "seconds"], default="frames", optional=True,
                     tooltip="Display the ruler, segment ranges, length input, and total in frames or seconds. Internal storage is always pixel-space frames.",
                 ),
+                RelayOptions.Input(
+                    "relay_options", optional=True,
+                    tooltip="Optional advanced per-stream tuning. Connect a Prompt Relay Advanced Options node.",
+                ),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
@@ -201,9 +221,9 @@ class PromptRelayEncodeTimeline(io.ComfyNode):
 
 
     @classmethod
-    def execute(cls, model, clip, latent, global_prompt, max_frames, timeline_data, local_prompts, segment_lengths, epsilon, fps=24.0, time_units="frames") -> io.NodeOutput:
+    def execute(cls, model, clip, latent, global_prompt, max_frames, timeline_data, local_prompts, segment_lengths, epsilon, fps=24.0, time_units="frames", relay_options=None) -> io.NodeOutput:
         patched, conditioning = _encode_relay(
-            model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon,
+            model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon, relay_options,
         )
         return io.NodeOutput(patched, conditioning)
 
@@ -211,9 +231,11 @@ class PromptRelayEncodeTimeline(io.ComfyNode):
 NODE_CLASS_MAPPINGS = {
     "PromptRelayEncode": PromptRelayEncode,
     "PromptRelayEncodeTimeline": PromptRelayEncodeTimeline,
+    "PromptRelayAdvancedOptions": PromptRelayAdvancedOptions,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PromptRelayEncode": "Prompt Relay Encode",
     "PromptRelayEncodeTimeline": "Prompt Relay Encode (Timeline)",
+    "PromptRelayAdvancedOptions": "Prompt Relay Advanced Options",
 }

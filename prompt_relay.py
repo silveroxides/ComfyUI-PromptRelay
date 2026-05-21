@@ -13,7 +13,8 @@ def build_temporal_cost(q_token_idx, Lq, Lk, device, dtype, tokens_per_frame):
     for seg in q_token_idx:
         local = seg["local_token_idx"].to(device=device)
         d = (query_frames.float()[:, None] - seg["midpoint"]).abs()
-        cost = (torch.relu(d - seg["window"]) ** 2) / (2 * seg["sigma"] ** 2)
+        strength = seg.get("strength", 1.0)
+        cost = strength * (torch.relu(d - seg["window"]) ** 2) / (2 * seg["sigma"] ** 2)
         offset[:, local] = cost.to(offset.dtype)
 
     return offset
@@ -27,20 +28,26 @@ def build_temporal_cost_scaled(q_token_idx, Lq, Lk, device, dtype, latent_frames
     for seg in q_token_idx:
         local = seg["local_token_idx"].to(device=device)
         d = (query_frames[:, None] - seg["midpoint"]).abs()
-        cost = (torch.relu(d - seg["window"]) ** 2) / (2 * seg["sigma"] ** 2)
+        sigma_a = seg.get("sigma_audio", seg["sigma"])
+        window_a = seg.get("window_audio", seg["window"])
+        strength_a = seg.get("strength_audio", 1.0)
+        cost = strength_a * (torch.relu(d - window_a) ** 2) / (2 * sigma_a ** 2)
         offset[:, local] = cost.to(offset.dtype)
 
     return offset
 
 
 def create_mask_fn(q_token_idx, fallback_tokens_per_frame, latent_frames):
-    """Closure: mask_fn(q, k, transformer_options) -> additive mask or None."""
+    """Closure: mask_fn(Lq, Lk, dtype, device, transformer_options) -> additive mask or None.
+
+    Takes shapes/dtype/device instead of tensors so callers can compute the mask
+    without first materializing q/k projections — required so PromptRelay can
+    wrap an existing cross-attn forward (e.g. KJNodes NAG) instead of replacing it.
+    """
     cache = {}
     max_token_idx = max(int(seg["local_token_idx"].max().item()) for seg in q_token_idx) + 1
 
-    def mask_fn(q, k, transformer_options):
-        Lq, Lk = q.shape[1], k.shape[1]
-
+    def mask_fn(Lq, Lk, dtype, device, transformer_options):
         if Lq == Lk:
             return None
 
@@ -59,27 +66,55 @@ def create_mask_fn(q_token_idx, fallback_tokens_per_frame, latent_frames):
 
         mode = "video" if Lq == video_lq else "scaled"
 
-        key = (Lq, Lk, mode, q.device)
+        key = (Lq, Lk, mode, device)
         if key not in cache:
             if mode == "video":
-                cost = build_temporal_cost(q_token_idx, Lq, Lk, q.device, q.dtype, video_tpf)
+                cost = build_temporal_cost(q_token_idx, Lq, Lk, device, dtype, video_tpf)
             else:
-                cost = build_temporal_cost_scaled(q_token_idx, Lq, Lk, q.device, q.dtype, latent_frames)
+                cost = build_temporal_cost_scaled(q_token_idx, Lq, Lk, device, dtype, latent_frames)
             log.info(
                 "[PromptRelay] Built penalty matrix (%s): Lq=%d, Lk=%d, nonzero=%d/%d",
                 mode, Lq, Lk, (cost > 0).sum().item(), cost.numel(),
             )
             cache[key] = -cost
 
-        return cache[key].to(q.dtype)
+        return cache[key].to(dtype)
 
     return mask_fn
 
 
-def build_segments(token_ranges, segment_lengths, epsilon=1e-3):
-    """Per-segment metadata (local_token_idx, midpoint, window, sigma) for the temporal penalty."""
+def build_segments(token_ranges, segment_lengths, epsilon=1e-3, relay_options=None):
+    """Per-segment metadata for the temporal penalty.
+
+    relay_options (optional dict) overrides per-stream knobs:
+        video_strength, video_window_scale,
+        audio_epsilon, audio_strength, audio_window_scale
+    Audio knobs only affect architectures whose cross-attention takes the scaled
+    (non-integer-frame) path — currently LTX audio_attn2.
+    """
     # Paper uses constant sigma = 1/ln(1/epsilon) regardless of segment length
     sigma = 1.0 / math.log(1.0 / epsilon) if 0 < epsilon < 1 else 0.1448
+
+    opts = relay_options or {}
+    v_strength = opts.get("video_strength", 1.0)
+    v_window_scale = opts.get("video_window_scale", 1.0)
+    a_epsilon = opts.get("audio_epsilon")
+    a_strength = opts.get("audio_strength", 1.0)
+    a_window_scale = opts.get("audio_window_scale", 1.0)
+
+    if a_epsilon is not None and 0 < a_epsilon < 1:
+        sigma_audio = 1.0 / math.log(1.0 / a_epsilon)
+    else:
+        sigma_audio = sigma
+
+    if relay_options:
+        log.info(
+            "[PromptRelay] Advanced options active — video: strength=%.3f window_scale=%.3f | "
+            "audio: epsilon=%s strength=%.3f window_scale=%.3f",
+            v_strength, v_window_scale,
+            f"{a_epsilon:.4f}" if a_epsilon is not None else "inherit",
+            a_strength, a_window_scale,
+        )
 
     q_token_idx = []
     frame_cursor = 0
@@ -89,12 +124,16 @@ def build_segments(token_ranges, segment_lengths, epsilon=1e-3):
             frame_cursor += L
             continue
         midpoint = (2 * frame_cursor + L) // 2
-        window = max(L // 2 - 2, 0)
+        base_window = max(L // 2 - 2, 0)
         q_token_idx.append({
             "local_token_idx": torch.arange(tok_start, tok_end),
             "midpoint": midpoint,
-            "window": window,
+            "window": max(base_window * v_window_scale, 0.0),
             "sigma": sigma,
+            "strength": v_strength,
+            "window_audio": max(base_window * a_window_scale, 0.0),
+            "sigma_audio": sigma_audio,
+            "strength_audio": a_strength,
         })
         frame_cursor += L
 
