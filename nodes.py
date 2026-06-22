@@ -1,4 +1,8 @@
 import logging
+import re
+import math
+import torch
+import comfy.utils
 
 from comfy_api.latest import io
 
@@ -228,14 +232,182 @@ class PromptRelayEncodeTimeline(io.ComfyNode):
         return io.NodeOutput(patched, conditioning)
 
 
+def _encode_relay_advanced(model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon, vlm_resolution, image_inputs, relay_options=None):
+    for name, val in (("global_prompt", global_prompt),
+                      ("local_prompts", local_prompts),
+                      ("segment_lengths", segment_lengths)):
+        if val is None:
+            raise ValueError(f"PromptRelay: '{name}' arrived as None.")
+
+    # 1. Parse autogrow images (0-indexed or 1-indexed)
+    raw_images = {}
+    if image_inputs is not None:
+        for k, v in image_inputs.items():
+            if v is not None:
+                digits = re.findall(r'\d+', k)
+                idx = int(digits[0]) if digits else 1
+                raw_images[idx] = v
+
+    is_zero_indexed = 0 in raw_images
+
+    # 2. Sequential left-to-right keyword replacement in global and local prompts
+    pattern = re.compile(r'image_input_(\d+)', re.IGNORECASE)
+    sub_token = "<img><image_soft_token><end_of_image>"
+    images_vl_raw = []
+
+    def replace_func(match):
+        num = int(match.group(1))
+        dict_key = num - 1 if is_zero_indexed else num
+        if dict_key in raw_images:
+            images_vl_raw.append(raw_images[dict_key])
+            return sub_token
+        return ""
+
+    modified_global = pattern.sub(replace_func, global_prompt)
+
+    locals_list = [p.strip() for p in local_prompts.split("|") if p.strip()]
+    if not locals_list:
+        raise ValueError("At least one local prompt is required (separate with |)")
+
+    modified_locals_list = []
+    for lp in locals_list:
+        mod_lp = pattern.sub(replace_func, lp)
+        modified_locals_list.append(mod_lp)
+
+    # 3. Handle latent geometry and segment distribution
+    arch, patch_size, temporal_stride = detect_model_type(model)
+    samples = latent["samples"]
+    latent_frames = samples.shape[2]
+    tokens_per_frame = (samples.shape[3] // patch_size[1]) * (samples.shape[4] // patch_size[2])
+
+    parsed_lengths = None
+    if segment_lengths.strip():
+        pixel_lengths = [int(x.strip()) for x in segment_lengths.split(",") if x.strip()]
+        parsed_lengths = _convert_to_latent_lengths(pixel_lengths, temporal_stride, latent_frames)
+
+    # 4. Token mapping
+    raw_tokenizer = get_raw_tokenizer(clip)
+    full_prompt, token_ranges = map_token_indices(raw_tokenizer, modified_global, modified_locals_list)
+
+    # 5. Tokenize text without passing images, getting raw 262144 token IDs
+    tokens = clip.tokenize(full_prompt, skip_template=True)
+
+    # 6. Preprocess and manually inject images sequentially into the 262144 tokens
+    if len(images_vl_raw) > 0:
+        def process_vlm_image(image, res):
+            if image is None:
+                return None
+            VLM_RESOLUTIONS = {
+                "Fast (384)": 384,
+                "Balanced (512)": 512,
+                "Detailed (768)": 768,
+                "Original": 896
+            }
+            samples = image.movedim(-1, 1)
+            vlm_size = VLM_RESOLUTIONS.get(res, 896)
+            total_vlm = vlm_size * vlm_size
+            scale_by_vlm = math.sqrt(total_vlm / (samples.shape[3] * samples.shape[2]))
+            width_vlm = round(samples.shape[3] * scale_by_vlm)
+            height_vlm = round(samples.shape[2] * scale_by_vlm)
+
+            interp = "area" if res == "Original" else "bicubic"
+            s_vlm = comfy.utils.common_upscale(samples, width_vlm, height_vlm, interp, "disabled")
+            return s_vlm.movedim(1, -1)[:, :, :, :3]
+
+        processed_images = [process_vlm_image(img, vlm_resolution) for img in images_vl_raw]
+
+        for key, val in tokens.items():
+            if isinstance(val, list):
+                embed_count = 0
+                for r in val:
+                    if isinstance(r, list):
+                        for i, token in enumerate(r):
+                            if isinstance(token, tuple) and len(token) > 0:
+                                if token[0] == 262144 and embed_count < len(processed_images):
+                                    r[i] = ({"type": "image", "data": processed_images[embed_count]},) + token[1:]
+                                    embed_count += 1
+
+    # 7. Encode and patch
+    conditioning = clip.encode_from_tokens_scheduled(tokens)
+    effective_lengths = distribute_segment_lengths(len(modified_locals_list), latent_frames, parsed_lengths)
+
+    q_token_idx = build_segments(token_ranges, effective_lengths, epsilon, relay_options)
+    mask_fn = create_mask_fn(q_token_idx, tokens_per_frame, latent_frames)
+
+    patched = model.clone()
+    apply_patches(patched, arch, mask_fn)
+
+    return patched, conditioning
+
+
+class PromptRelayEncodeAdvanced(io.ComfyNode):
+    """Encodes temporal local prompts containing dynamic image inputs and patches the model (Advanced)."""
+
+    @classmethod
+    def define_schema(cls):
+        autogrow_template = io.Autogrow.TemplatePrefix(
+            io.Image.Input("image", optional=True),
+            prefix="image",
+            min=1,
+            max=16
+        )
+        return io.Schema(
+            node_id="PromptRelayEncodeAdvanced",
+            display_name="Prompt Relay Encode (Advanced)",
+            category="conditioning/prompt_relay",
+            inputs=[
+                io.Model.Input("model"),
+                io.Clip.Input("clip"),
+                io.Latent.Input("latent", tooltip="Empty latent video — dimensions are read from its shape."),
+                io.String.Input(
+                    "global_prompt", multiline=True, default="",
+                    tooltip="Conditions the entire video. Supports image_input_X keywords.",
+                ),
+                io.String.Input(
+                    "local_prompts", multiline=True, default="",
+                    tooltip="Ordered prompts for each temporal segment, separated by |. Supports image_input_X keywords.",
+                ),
+                io.String.Input(
+                    "segment_lengths", default="",
+                    tooltip="Comma-separated pixel space frame counts per segment. Leave empty to auto-distribute evenly.",
+                ),
+                io.Float.Input(
+                    "epsilon", default=1e-3, min=1e-6, max=0.99, step=1e-4,
+                ),
+                io.Combo.Input(
+                    "vlm_resolution",
+                    options=["Fast (384)", "Balanced (512)", "Detailed (768)", "Original"],
+                    default="Fast (384)",
+                ),
+                RelayOptions.Input(
+                    "relay_options", optional=True,
+                ),
+                io.Autogrow.Input("image_inputs", template=autogrow_template),
+            ],
+            outputs=[
+                io.Model.Output(display_name="model"),
+                io.Conditioning.Output(display_name="positive"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon, vlm_resolution, image_inputs, relay_options=None) -> io.NodeOutput:
+        patched, conditioning = _encode_relay_advanced(
+            model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon, vlm_resolution, image_inputs, relay_options,
+        )
+        return io.NodeOutput(patched, conditioning)
+
+
 NODE_CLASS_MAPPINGS = {
     "PromptRelayEncode": PromptRelayEncode,
     "PromptRelayEncodeTimeline": PromptRelayEncodeTimeline,
+    "PromptRelayEncodeAdvanced": PromptRelayEncodeAdvanced,
     "PromptRelayAdvancedOptions": PromptRelayAdvancedOptions,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PromptRelayEncode": "Prompt Relay Encode",
     "PromptRelayEncodeTimeline": "Prompt Relay Encode (Timeline)",
+    "PromptRelayEncodeAdvanced": "Prompt Relay Encode (Advanced)",
     "PromptRelayAdvancedOptions": "Prompt Relay Advanced Options",
 }

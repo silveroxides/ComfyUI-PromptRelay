@@ -1,6 +1,6 @@
 import logging
 from comfy_api.latest import io
-from .nodes import _encode_relay
+from .nodes import _encode_relay, _encode_relay_advanced
 from .prompt_relay import get_raw_tokenizer
 from .parser import parse_smart_prompt
 
@@ -143,3 +143,91 @@ class PromptRelaySmartEncodeTest(io.ComfyNode):
             output_lines.append(line)
 
         return io.NodeOutput("\n".join(output_lines))
+
+
+class PromptRelaySmartEncodeAdvanced(io.ComfyNode):
+    """Parses advanced smart syntax containing dynamic image inputs into Prompt Relay segments (Advanced)."""
+
+    @classmethod
+    def define_schema(cls):
+        autogrow_template = io.Autogrow.TemplatePrefix(
+            io.Image.Input("image", optional=True),
+            prefix="image",
+            min=1,
+            max=16
+        )
+        return io.Schema(
+            node_id="PromptRelaySmartEncodeAdvanced",
+            display_name="Prompt Relay Encode (Smart/Advanced)",
+            category="conditioning/prompt_relay",
+            inputs=[
+                io.Model.Input("model"),
+                io.Clip.Input("clip"),
+                io.Latent.Input("latent"),
+                io.String.Input(
+                    "global_prompt", multiline=True, default="",
+                    tooltip="Conditions entire video. Leave empty to auto-use the first parsed segment from smart_prompt as the global anchor. Supports image_input_X keywords."
+                ),
+                io.String.Input(
+                    "smart_prompt", multiline=True, default="",
+                    tooltip="Enter prompt using Smart Syntax. Supports image_input_X keywords."
+                ),
+                io.Boolean.Input("normalize_by_tokens", default=False),
+                io.Float.Input("epsilon", default=1e-3, min=1e-6, max=0.99, step=1e-4),
+                io.Combo.Input(
+                    "vlm_resolution",
+                    options=["Fast (384)", "Balanced (512)", "Detailed (768)", "Original"],
+                    default="Fast (384)",
+                ),
+                io.Autogrow.Input("image_inputs", template=autogrow_template),
+            ],
+            outputs=[
+                io.Model.Output(display_name="model"),
+                io.Conditioning.Output(display_name="positive"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, model, clip, latent, global_prompt, smart_prompt, normalize_by_tokens, epsilon, vlm_resolution, image_inputs) -> io.NodeOutput:
+        parsed = parse_smart_prompt(smart_prompt)
+
+        valid_segments = [s for s in parsed if s["text"].strip()]
+        if not valid_segments:
+            valid_segments = [{"text": " ", "weight": 1.0}]
+
+        raw_tokenizer = get_raw_tokenizer(clip) if normalize_by_tokens else None
+
+        local_prompts_list = []
+        weights_list = []
+
+        for seg in valid_segments:
+            text = seg["text"]
+            weight = seg["weight"]
+
+            if normalize_by_tokens and raw_tokenizer:
+                try:
+                    tokens = raw_tokenizer(text)["input_ids"]
+                    has_eos = getattr(raw_tokenizer, "add_eos", False)
+                    token_count = len(tokens) - (1 if has_eos else 0)
+                    token_count = max(1, token_count)
+                    weight *= token_count
+                except Exception as e:
+                    log.warning(f"Token counting failed for segment '{text}': {e}")
+
+            local_prompts_list.append(text)
+            weights_list.append(weight)
+
+        local_prompts_str = " | ".join(local_prompts_list)
+
+        scale_factor = 100000.0
+        segment_lengths_str = ", ".join(str(int(w * scale_factor)) for w in weights_list)
+
+        global_prompt_str = global_prompt.strip()
+        if not global_prompt_str and valid_segments:
+            global_prompt_str = valid_segments[0]["text"]
+
+        patched, conditioning = _encode_relay_advanced(
+            model, clip, latent, global_prompt_str, local_prompts_str, segment_lengths_str, epsilon, vlm_resolution, image_inputs
+        )
+
+        return io.NodeOutput(patched, conditioning)
